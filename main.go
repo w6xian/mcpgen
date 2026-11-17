@@ -10,21 +10,30 @@
 //
 //	// 把 PDF 回单解析成 JSON。          ← 第一行 = summary（无前缀的行）
 //	// when: 用户上传回单需要结构化入库时调用
+//	// service: receipt                  ← 可选：覆盖 -service（一个包里有多个服务段时用）
 //	// input: ReceiptRequest            ← 指向同包结构体，schema 从 json tag 推导
+//	// input_schema: {"type":"object",…} ← 可选：直接手写完整 schema（须是 JSON 对象），优先于 input:
 //	// example: {"data":"<base64>"}
 //	func (h *ReceiptService) ToJson(ctx context.Context, b []byte) ([]byte, error)
 //
 // required 判定：json tag 无 omitempty 即必填；`mcp:"说明"` tag 变成字段描述。
+// input_schema 可跨行（从该行起续到 JSON 合法为止；字符串值不可拆行）；
+// 遇到下一条声明（when:/input:/example:…）还没拼合法就停手并告警，不吞后续声明；
+// 内容必须是 JSON 对象，否则告警并忽略。写了它就不再从 input: 推导。
 //
 // 用法：
 //
-//	go run 路径/rpc-proxy/cmd/mcpgen -dir ./cmd/sloth -service receipt
+//	go get -tool github.com/w6xian/mcpgen@v0.0.2   # 消费方仓库固定版本
+//	//go:generate go tool mcpgen -dir . -service receipt
+//	mcpgen -check -dir . -service receipt          # CI 漂移卡点：产物过期即 exit 1
 //
 // 产物提交进仓库；改了注释/方法后重新生成。生成时做漂移检查：
-// 没写注释的 RPC 方法、input 指向的未知结构体，都会打 WARN（不阻断）。
+// 没写注释的 RPC 方法、input 指向的未知结构体、非法 schema，都会打 WARN（不阻断；
+// 用 -check 可以把"改了注释没重新生成"变成 CI 的硬卡点）。
 package main
 
 import (
+	"bytes"
 	"encoding/json"
 	"flag"
 	"fmt"
@@ -34,9 +43,20 @@ import (
 	"go/token"
 	"os"
 	"path/filepath"
+	"reflect"
 	"sort"
 	"strings"
 )
+
+// schemaVersion 与代理侧 registry.ToolSchemaVersion 对齐的能力清单格式版本。
+const schemaVersion = 1
+
+// knownKeys 是注释里会被识别为声明的前缀 key（小写）。
+// 多行 input_schema 续行遇到其中之一即停止拼接——声明不能被 schema 吞掉。
+var knownKeys = map[string]bool{
+	"when": true, "input": true, "input_schema": true,
+	"example": true, "summary": true, "service": true,
+}
 
 // toolDecl 生成产物里的一条声明（JSON 字段与代理侧 registry.ToolDecl 对齐）。
 type toolDecl struct {
@@ -50,11 +70,10 @@ type toolDecl struct {
 
 // rpcMethod 解析出来的一个 RPC 方法。
 type rpcMethod struct {
-	recv   string // 接收者类型名
-	name   string // 方法名（线上就是它，sloth 只收录导出方法）
-	doc    string // doc comment 原文（含换行）
-	decl   *ast.FuncDecl
-	summary, when, input, example string
+	name string // 方法名（线上就是它，sloth 只收录导出方法）
+	doc  string // doc comment 原文（含换行）
+
+	summary, when, input, example, service, inputSchema string
 }
 
 func main() {
@@ -63,35 +82,90 @@ func main() {
 		service = flag.String("service", "", "默认 service 名（HTTP 路径里那段）；方法注释 service: 可覆盖")
 		out     = flag.String("out", "", "输出文件（默认 <dir>/tools_gen.go）")
 		pkg     = flag.String("pkg", "", "产物 package 名（默认沿用被解析包的）")
+		check   = flag.Bool("check", false, "只校验：重新生成并与现有产物比对，不一致退出码 1（CI 卡点）")
 	)
 	flag.Parse()
 	if *service == "" {
 		fatal("-service 必填：这是 HTTP 路径里的 service 段")
 	}
 
-	methods, structs, pkgName, err := parse(*dir)
+	code, n, warns, err := generate(*dir, *service, *pkg)
 	if err != nil {
-		fatal("解析失败: %v", err)
+		fatal("%v", err)
 	}
-	if len(methods) == 0 {
-		fatal("没找到任何 RPC 方法（导出类型上的导出方法，签名 (context.Context, []byte) + 两个返回值）")
+	target := outPath(*dir, *out)
+
+	if *check {
+		existing, err := os.ReadFile(target)
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "mcpgen: CHECK 失败: %s 不存在（先跑一次生成并提交产物）\n", target)
+			os.Exit(1)
+		}
+		if !bytes.Equal(existing, code) {
+			fmt.Fprintf(os.Stderr,
+				"mcpgen: CHECK 失败: %s 与注释不一致（%d 条声明）——方法或注释改了但没重新生成；"+
+					"执行 go generate 并提交产物\n", target, n)
+			os.Exit(1)
+		}
+		fmt.Printf("mcpgen: CHECK 通过，%s 与注释一致（%d 条声明）\n", target, n)
+		return
 	}
 
-	var warns []string
+	if err := os.WriteFile(target, code, 0o644); err != nil {
+		fatal("写出失败: %v", err)
+	}
+	fmt.Printf("mcpgen: %s 生成 %d 条声明（service=%s）\n", target, n, *service)
+	for _, w := range warns {
+		fmt.Fprintf(os.Stderr, "mcpgen: WARN %s\n", w)
+	}
+}
+
+func fatal(f string, args ...any) {
+	fmt.Fprintf(os.Stderr, "mcpgen: "+f+"\n", args...)
+	os.Exit(1)
+}
+
+func outPath(dir, out string) string {
+	if out != "" {
+		return out
+	}
+	return filepath.Join(dir, "tools_gen.go")
+}
+
+// generate 完整生成流程：解析目录 → 提取声明 → 推导 schema → 渲染产物。
+// 返回格式化后的代码、声明条数与漂移告警列表。
+// pkgFlag 为空时产物 package 名沿用被解析包的。
+func generate(dir, service, pkgFlag string) (code []byte, n int, warns []string, err error) {
+	methods, structs, pkgName, err := parse(dir)
+	if err != nil {
+		return nil, 0, nil, fmt.Errorf("解析失败: %w", err)
+	}
+	if len(methods) == 0 {
+		return nil, 0, nil, fmt.Errorf(
+			"没找到任何 RPC 方法（导出类型上的导出方法，签名 (context.Context, []byte) + 两个返回值）")
+	}
+
 	tools := make([]toolDecl, 0, len(methods))
 	for _, m := range methods {
 		parseDoc(m, &warns)
+		svc := service
+		if m.service != "" {
+			svc = m.service // 方法级 service: 覆盖 -service
+		}
 		t := toolDecl{
-			Service: *service,
+			Service: svc,
 			Method:  m.name,
 			Summary: m.summary,
 			When:    m.when,
 			Example: m.example,
 		}
-		if m.input != "" {
+		if m.inputSchema != "" {
+			// 显式注释优先：原样记录，不再从 input: 推导
+			t.InputSchema = m.inputSchema
+		} else if m.input != "" {
 			st, ok := structs[m.input]
 			if !ok {
-				warns = append(warns, fmt.Sprintf("%s: input 指向的结构体 %q 不在同包内，跳过 schema 推导（外部包结构体请手写 example 或把类型挪进同包）", m.name, m.input))
+				warns = append(warns, fmt.Sprintf("%s: input 指向的结构体 %q 不在同包内，跳过 schema 推导（外部包结构体请用 input_schema: 手写，或把类型挪进同包）", m.name, m.input))
 			} else {
 				schema := objectSchema(st, structs)
 				raw, _ := json.Marshal(schema)
@@ -110,30 +184,12 @@ func main() {
 		return tools[i].Method < tools[j].Method
 	})
 
-	pkgOut := *pkg
-	if pkgOut == "" {
-		pkgOut = pkgName
+	pkgOut := pkgName
+	if pkgFlag != "" {
+		pkgOut = pkgFlag
 	}
-	code := render(pkgOut, tools)
-	if err := os.WriteFile(outPath(*dir, *out), code, 0o644); err != nil {
-		fatal("写出失败: %v", err)
-	}
-	fmt.Printf("mcpgen: %s 生成 %d 条声明（service=%s）\n", outPath(*dir, *out), len(tools), *service)
-	for _, w := range warns {
-		fmt.Fprintf(os.Stderr, "mcpgen: WARN %s\n", w)
-	}
-}
-
-func fatal(f string, args ...any) {
-	fmt.Fprintf(os.Stderr, "mcpgen: "+f+"\n", args...)
-	os.Exit(1)
-}
-
-func outPath(dir, out string) string {
-	if out != "" {
-		return out
-	}
-	return filepath.Join(dir, "tools_gen.go")
+	code = render(pkgOut, tools)
+	return code, len(tools), warns, nil
 }
 
 // parse 解析目录：返回 RPC 方法列表、同包结构体索引、包名。
@@ -156,7 +212,7 @@ func parse(dir string) ([]*rpcMethod, map[string]*ast.StructType, string, error)
 		for _, file := range pkg.Files {
 			// 跳过生成产物：tools_gen.go 里的 MCPMetaService.Tools 也长得像
 			// RPC 方法，不跳过的话下次生成会把清单自身收录进清单
-			if isGeneratedFile(file) {
+			if isGeneratedFile(fset, file) {
 				continue
 			}
 			for _, decl := range file.Decls {
@@ -183,11 +239,15 @@ func parse(dir string) ([]*rpcMethod, map[string]*ast.StructType, string, error)
 	return methods, structs, pkgName, nil
 }
 
-// isGeneratedFile 文件头含 "Code generated"（go 生成约定标记）则跳过。
-func isGeneratedFile(f *ast.File) bool {
+// isGeneratedFile 按 go 生成约定判断：package 子句之前出现 "Code generated"
+// 注释才算（go.dev/s/generatedcode）。只扫正文不算——正文注释里提到这几个字
+// 不该让整个文件被跳过。
+func isGeneratedFile(fset *token.FileSet, f *ast.File) bool {
+	pkgLine := fset.Position(f.Package).Line
 	for _, c := range f.Comments {
 		for _, cm := range c.List {
-			if strings.Contains(cm.Text, "Code generated") {
+			if fset.Position(cm.Pos()).Line < pkgLine &&
+				strings.Contains(cm.Text, "Code generated") {
 				return true
 			}
 		}
@@ -207,25 +267,25 @@ func asRPCMethod(d *ast.FuncDecl) (*rpcMethod, bool) {
 	if !isCtx(d.Type.Params.List[0].Type) || !isBytes(d.Type.Params.List[1].Type) {
 		return nil, false
 	}
-	recv := "*"
 	switch r := d.Recv.List[0].Type.(type) {
 	case *ast.StarExpr:
 		if id, ok := r.X.(*ast.Ident); ok && id.IsExported() {
-			recv = id.Name
+			return newMethod(d), true
 		}
 	case *ast.Ident:
 		if r.IsExported() {
-			recv = r.Name
+			return newMethod(d), true
 		}
 	}
-	if recv == "*" {
-		return nil, false
-	}
+	return nil, false
+}
+
+func newMethod(d *ast.FuncDecl) *rpcMethod {
 	doc := ""
 	if d.Doc != nil {
 		doc = d.Doc.Text()
 	}
-	return &rpcMethod{recv: recv, name: d.Name.Name, doc: doc, decl: d}, true
+	return &rpcMethod{name: d.Name.Name, doc: doc}
 }
 
 func isCtx(e ast.Expr) bool {
@@ -253,13 +313,39 @@ func isBytes(e ast.Expr) bool {
 }
 
 // parseDoc 从 doc comment 里抠声明：第一行 = summary；
-// when: / input: / example: / summary: 前缀行按字段收。
+// when: / input: / input_schema: / example: / service: / summary: 前缀行按字段收。
+// input_schema 允许跨行：从该行起逐行拼到 JSON 合法为止（字符串值不可拆行）；
+// 拼接途中遇到下一条声明即停手告警——后续声明不能被吞。
 func parseDoc(m *rpcMethod, warns *[]string) {
 	lines := strings.Split(m.doc, "\n")
+	var schemaLines []string
+	inSchema := false
+	schemaWarn := func(reason string) {
+		*warns = append(*warns, fmt.Sprintf("%s: input_schema %s，已忽略", m.name, reason))
+	}
 	for _, line := range lines {
 		line = strings.TrimSpace(line)
 		if line == "" {
 			continue
+		}
+		if inSchema {
+			if isDeclLine(line) {
+				// 拼了半天还没合法就撞上声明了：多半是 JSON 写错了
+				inSchema = false
+				schemaWarn("多行拼接未得到合法 JSON 就遇到下一条声明 " + line)
+				// 不 continue：让本行落回下面的正常声明处理
+			} else {
+				schemaLines = append(schemaLines, line)
+				if joined := strings.Join(schemaLines, ""); json.Valid([]byte(joined)) {
+					if validSchemaObject(joined) {
+						m.inputSchema = joined
+					} else {
+						schemaWarn("不是 JSON 对象")
+					}
+					inSchema = false
+				}
+				continue
+			}
 		}
 		key, val := splitKv(line)
 		switch strings.ToLower(key) {
@@ -267,6 +353,19 @@ func parseDoc(m *rpcMethod, warns *[]string) {
 			m.when = val
 		case "input":
 			m.input = val
+		case "service":
+			m.service = val
+		case "input_schema":
+			if !validSchemaObject(val) {
+				if json.Valid([]byte(val)) {
+					schemaWarn("不是 JSON 对象")
+				} else {
+					inSchema = true
+					schemaLines = []string{val}
+				}
+			} else {
+				m.inputSchema = val
+			}
 		case "example":
 			m.example = val
 		case "summary":
@@ -278,15 +377,35 @@ func parseDoc(m *rpcMethod, warns *[]string) {
 			}
 		}
 	}
+	if inSchema {
+		schemaWarn("多行拼接未得到合法 JSON（注释结束都没拼上）")
+	}
+}
+
+// isDeclLine 该行是否是一条声明（多行 schema 的续行遇到它要停）。
+func isDeclLine(line string) bool {
+	key, _ := splitKv(line)
+	return knownKeys[strings.ToLower(key)]
+}
+
+// validSchemaObject 校验 val 是合法 JSON 且顶层是对象。
+func validSchemaObject(val string) bool {
+	var obj map[string]any
+	return json.Unmarshal([]byte(val), &obj) == nil && obj != nil
 }
 
 // splitKv 把 "when: xxx" 拆成 ("when", "xxx")；无冒号返回原行。
+// 冒号前含空格视为散文（比如"撞上 example: 声明"这种句子），不当 key。
 func splitKv(line string) (string, string) {
 	idx := strings.Index(line, ":")
 	if idx <= 0 {
 		return "", ""
 	}
-	return strings.TrimSpace(line[:idx]), strings.TrimSpace(line[idx+1:])
+	key := strings.TrimSpace(line[:idx])
+	if strings.ContainsAny(key, " \t") {
+		return "", ""
+	}
+	return key, strings.TrimSpace(line[idx+1:])
 }
 
 // ===== JSON Schema 推导 =====
@@ -329,26 +448,19 @@ func jsonName(field *ast.Field) (name string, omitempty bool, desc string) {
 	if field.Tag == nil {
 		return name, false, ""
 	}
-	tag := strings.Trim(field.Tag.Value, "`")
-	for _, part := range strings.Split(strings.Trim(tag, "\""), "\"") {
-		part = strings.TrimSpace(part)
-		switch {
-		case strings.HasPrefix(part, "json:"):
-			val := strings.TrimPrefix(part, "json:")
-			bits := strings.Split(val, ",")
-			if bits[0] != "" {
-				name = bits[0]
+	tag := reflect.StructTag(strings.Trim(field.Tag.Value, "`"))
+	if v, ok := tag.Lookup("json"); ok {
+		bits := strings.Split(v, ",")
+		if bits[0] != "" {
+			name = bits[0]
+		}
+		for _, b := range bits[1:] {
+			if b == "omitempty" {
+				omitempty = true
 			}
-			for _, b := range bits[1:] {
-				if b == "omitempty" {
-					omitempty = true
-				}
-			}
-		case strings.HasPrefix(part, "mcp:"):
-			desc = strings.TrimPrefix(part, "mcp:")
 		}
 	}
-	return name, omitempty, desc
+	return name, omitempty, tag.Get("mcp")
 }
 
 // fieldSchema 单个字段类型 → schema 片段。
@@ -418,7 +530,7 @@ func astString(e ast.Expr) string {
 func render(pkg string, tools []toolDecl) []byte {
 	var b strings.Builder
 	b.WriteString("// Code generated by mcpgen; DO NOT EDIT.\n")
-	b.WriteString("// 由 rpc-proxy/cmd/mcpgen 从源码注释生成：改注释后重新生成，不要手改本文件。\n\n")
+	b.WriteString("// 由 github.com/w6xian/mcpgen 从源码注释生成：改注释后跑 go generate 重新生成，不要手改本文件。\n\n")
 	b.WriteString("package " + pkg + "\n\n")
 	b.WriteString("import (\n\t\"context\"\n\t\"encoding/json\"\n)\n\n")
 
@@ -459,18 +571,21 @@ type MCPMetaService struct{}
 // Tools 回包结构与 rpc-proxy 侧 registry.ToolsManifest 对齐。
 func (MCPMetaService) Tools(ctx context.Context, _ []byte) ([]byte, error) {
 	return json.Marshal(map[string]any{
-		"schema_version": 1,
+		"schema_version": schemaVersionLiteral,
 		"tools":          MCPTools,
 	})
 }
 `)
-	out, err := format.Source([]byte(b.String()))
+	// 生成包里没有本包的常量，直接填字面量
+	out := strings.ReplaceAll(b.String(), "schemaVersionLiteral",
+		fmt.Sprintf("%d", schemaVersion))
+	formatted, err := format.Source([]byte(out))
 	if err != nil {
 		// format 失败说明生成器模板有 bug，退回未格式化版本，别静默
 		fmt.Fprintf(os.Stderr, "mcpgen: WARN 产物 format 失败（%v），按原样写出\n", err)
-		return []byte(b.String())
+		return []byte(out)
 	}
-	return out
+	return formatted
 }
 
 func quote(s string) string {
